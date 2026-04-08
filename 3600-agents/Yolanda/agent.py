@@ -15,6 +15,8 @@ class PlayerAgent:
 
     def play(self, board, sensor_data, time_left):
         moves = board.get_valid_moves()
+        moves = [m for m in moves if not (m.move_type == MoveType.CARPET and m.roll_length == 1)]
+    
         best_move = None
         best_score = -9999
 
@@ -27,7 +29,7 @@ class PlayerAgent:
                 best_score = score
                 best_move = m
 
-        return best_move if best_move else random.choice(moves)
+        return best_move if best_move else random.choice(board.get_valid_moves())
 
     def minimax(self, board, depth, is_my_turn):
         if depth == 0 or board.is_game_over():
