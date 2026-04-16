@@ -8,23 +8,23 @@ from game import board, move, enums
 
 CARPET_PTS = {1: -1, 2: 2, 3: 4, 4: 6, 5: 10, 6: 15, 7: 21}
 
-
 class RatTracker:
     def __init__(self, T: np.ndarray):
         self.T = T
         self.num_cells = 64
         self.belief = np.zeros(self.num_cells)
-        self.belief[0] = 1.0
+        self.belief[0] = 1.0 
         for _ in range(1000):
             self.belief = self.belief @ self.T
-
+            
     def update(self, board_state: board.Board, noise_enum: enums.Noise, distance_estimate: int):
         self.belief = self.belief @ self.T
         likelihood = np.zeros(self.num_cells)
         worker_loc = board_state.player_worker.get_location()
         for i in range(self.num_cells):
             y, x = divmod(i, 8)
-            cell_type = board_state.get_cell((x, y))
+            cell_loc = (x, y)
+            cell_type = board_state.get_cell(cell_loc)
             prob_noise = self._get_noise_prob(cell_type, noise_enum)
             true_dist = abs(worker_loc[0] - x) + abs(worker_loc[1] - y)
             prob_dist = self._get_dist_prob(true_dist, distance_estimate)
@@ -35,7 +35,7 @@ class RatTracker:
             self.belief /= total_prob
         else:
             self.belief = np.ones(self.num_cells) / self.num_cells
-
+            
     def _get_noise_prob(self, cell_type: enums.Cell, noise_enum: enums.Noise) -> float:
         if cell_type == enums.Cell.BLOCKED:
             probs = {enums.Noise.SQUEAK: 0.5, enums.Noise.SCRATCH: 0.3, enums.Noise.SQUEAL: 0.2}
@@ -48,16 +48,15 @@ class RatTracker:
         else:
             probs = {enums.Noise.SQUEAK: 0.33, enums.Noise.SCRATCH: 0.33, enums.Noise.SQUEAL: 0.34}
         return probs.get(noise_enum, 0.0)
-
+        
     def _get_dist_prob(self, true_dist: int, est_dist: int) -> float:
         diff = est_dist - true_dist
-        if true_dist == 0 and est_dist == 0: return 0.82
+        if true_dist == 0 and est_dist == 0: return 0.82 
         if diff == -1: return 0.12
-        if diff == 0:  return 0.70
-        if diff == 1:  return 0.12
-        if diff == 2:  return 0.06
+        if diff == 0: return 0.70
+        if diff == 1: return 0.12
+        if diff == 2: return 0.06
         return 0.0
-
 
 class PlayerAgent:
     def __init__(self, board_state: board.Board, transition_matrix=None, time_left: Callable = None):
@@ -65,63 +64,81 @@ class PlayerAgent:
         self.tracker = RatTracker(self.T) if self.T is not None else None
         self.total_turns = enums.MAX_TURNS_PER_PLAYER
         self.turns_taken = 0
-
+        
     def commentate(self):
-        return "Running Iterative Deepening Minimax."
+        return "Contested Carpet Heuristic v2"
 
     def play(self, board_state: board.Board, sensor_data: Tuple, time_left: Callable):
         start_time = time.time()
         noise_val, dist_val = sensor_data
-
+        
         last_search_loc, last_search_result = board_state.player_search
         if last_search_result and self.tracker:
             self.tracker = RatTracker(self.T)
-
+            
         if self.tracker:
             self.tracker.update(board_state, noise_val, dist_val)
-
+            
         moves = board_state.get_valid_moves(exclude_search=False)
         if not moves:
             return None
 
-        if self.tracker:
-            best_cell_idx = int(np.argmax(self.tracker.belief))
-            best_prob = self.tracker.belief[best_cell_idx]
-            # Lower threshold: EV positive when p > 0.333; use 0.40 so we actually search
-            # when the HMM has reasonable confidence, rather than the original 0.85 that never fires
-            if best_prob > 0.40:
-                y, x = divmod(best_cell_idx, 8)
-                search_move = move.Move.search((x, y))
-                if search_move in moves:
-                    self.turns_taken += 1
-                    return search_move
-
+        # Use time_left() callable for hard real-time cap
         time_remaining = time_left()
         turns_left = max(1, self.total_turns - self.turns_taken)
-        time_budget = (time_remaining / turns_left) * 0.9
-        time_budget = min(time_budget, time_remaining - 0.5)
-
-        best_move = random.choice([m for m in moves if m.move_type != enums.MoveType.SEARCH])
+        # Per-turn budget: fraction of remaining time
+        time_budget = (time_remaining / turns_left) * 0.75
+        # Hard cap: never use more than remaining - 1.5s safety buffer
+        time_budget = min(time_budget, time_remaining - 1.5)
+        time_budget = max(time_budget, 0.05)  # minimum 50ms
+        
+        safe_moves = [m for m in moves if m.move_type != enums.MoveType.SEARCH]
+        best_move = random.choice(safe_moves) if safe_moves else moves[0]
+        best_spatial_eval = -float('inf')
         depth = 1
-
+        
         try:
             while depth < 10:
-                eval_score, current_best_move = self.minimax(
-                    board_state, depth, -float('inf'), float('inf'),
+                eval_score, current_best_move = self.spatial_minimax(
+                    board_state, depth, -float('inf'), float('inf'), 
                     True, start_time, time_budget
                 )
                 if current_best_move:
+                    best_spatial_eval = eval_score
                     best_move = current_best_move
                 depth += 1
         except TimeoutError:
             pass
 
         self.turns_taken += 1
+
+        # FIX 2: search comparison with hard EV guard
+        # search_ev > 0 ensures p > 1/3 (mathematical breakeven)
+        # search_eval uses current point diff as base to match minimax scale
+        # This prevents searching when board eval is negative due to opponent having good carpet
+        if self.tracker:
+            best_cell_idx = int(np.argmax(self.tracker.belief))
+            p_catch = self.tracker.belief[best_cell_idx]
+            search_ev = (p_catch * 4.0) + ((1.0 - p_catch) * -2.0)
+            
+            if search_ev > 0:  # Only consider if p > 1/3
+                cur_pts = board_state.player_worker.get_points()
+                opp_pts = board_state.opponent_worker.get_points()
+                # Base the comparison on point diff to avoid the "negative board" trap
+                search_eval = (cur_pts - opp_pts) * 100.0 + search_ev * 100.0
+                if search_eval > best_spatial_eval:
+                    y, x = divmod(best_cell_idx, 8)
+                    sm = move.Move.search((x, y))
+                    if sm in moves:
+                        return sm
+            
         return best_move
 
-    def minimax(self, current_board, depth, alpha, beta, is_maximizing, start_time, time_limit):
-        if time.time() - start_time > time_limit:
+    def spatial_minimax(self, current_board, depth, alpha, beta, is_maximizing, start_time, time_limit):
+        elapsed = time.time() - start_time
+        if elapsed > time_limit:
             raise TimeoutError()
+
         if depth == 0 or current_board.is_game_over():
             return self.evaluate_board(current_board, is_maximizing), None
 
@@ -138,7 +155,7 @@ class PlayerAgent:
                 next_board = current_board.forecast_move(m, check_ok=False)
                 if not next_board: continue
                 next_board.reverse_perspective()
-                eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, False, start_time, time_limit)
+                eval_score, _ = self.spatial_minimax(next_board, depth - 1, alpha, beta, False, start_time, time_limit)
                 if eval_score > max_eval:
                     max_eval = eval_score
                     best_move = m
@@ -152,7 +169,7 @@ class PlayerAgent:
                 next_board = current_board.forecast_move(m, check_ok=False)
                 if not next_board: continue
                 next_board.reverse_perspective()
-                eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, True, start_time, time_limit)
+                eval_score, _ = self.spatial_minimax(next_board, depth - 1, alpha, beta, True, start_time, time_limit)
                 if eval_score < min_eval:
                     min_eval = eval_score
                     best_move = m
@@ -163,43 +180,37 @@ class PlayerAgent:
 
     def order_moves(self, moves):
         def move_priority(m):
-            if m.move_type == enums.MoveType.CARPET:
+            if m.move_type == enums.MoveType.CARPET: 
                 if m.roll_length == 1:
-                    return -1
-                return 3 + m.roll_length * 2
-            if m.move_type == enums.MoveType.PRIME: return 2
-            return 1
+                    return -10
+                return 100 + (m.roll_length * 5)
+            if m.move_type == enums.MoveType.PRIME: return 50
+            return 0
         return sorted(moves, key=move_priority, reverse=True)
 
-    def _carpet_potential(self, b: board.Board, pos) -> float:
-        """
-        For each direction from pos, compute the value of the longest carpet
-        we could EVENTUALLY roll: count contiguous primed squares already there,
-        then contiguous space squares we could still prime.
-        Return the sum of potential carpet values across all 4 directions.
-        This incentivises positioning near long prime chains before rolling.
-        """
+    def _contested_carpet_potential(self, b: board.Board, my_pos, opp_pos) -> float:
+        """Evaluates potential carpet lines weighted by who is closer."""
         directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-        total = 0.0
+        net_potential = 0.0
         for dx, dy in directions:
             primed = 0
             space = 0
-            cx, cy = pos[0] + dx, pos[1] + dy
-            # Count contiguous primed squares in this direction
+            cx, cy = my_pos[0] + dx, my_pos[1] + dy
             while b.is_valid_cell((cx, cy)) and b.get_cell((cx, cy)) == enums.Cell.PRIMED:
-                primed += 1
-                cx += dx
-                cy += dy
-            # Count contiguous space squares beyond (future primes)
+                primed += 1; cx += dx; cy += dy
             while b.is_valid_cell((cx, cy)) and b.get_cell((cx, cy)) == enums.Cell.SPACE:
-                space += 1
-                cx += dx
-                cy += dy
+                space += 1; cx += dx; cy += dy
             run = primed + space
             if run >= 2:
-                # Value = points we'd score if we eventually built and rolled this whole run
-                total += CARPET_PTS.get(min(run, 7), 21)
-        return total
+                potential_points = CARPET_PTS.get(min(run, 7), 21)
+                start_x, start_y = my_pos[0] + dx, my_pos[1] + dy
+                my_dist = abs(my_pos[0] - start_x) + abs(my_pos[1] - start_y)
+                opp_dist = abs(opp_pos[0] - start_x) + abs(opp_pos[1] - start_y)
+                if my_dist <= opp_dist:
+                    net_potential += potential_points
+                else:
+                    net_potential -= potential_points * 1.5
+        return net_potential
 
     def evaluate_board(self, b: board.Board, is_maximizing: bool) -> float:
         if is_maximizing:
@@ -213,53 +224,42 @@ class PlayerAgent:
             my_moves = b.get_valid_moves(enemy=True, exclude_search=True)
             opp_moves = b.get_valid_moves(enemy=False, exclude_search=True)
 
-        score = (my_worker.get_points() - opp_worker.get_points()) * 100
+        my_pos = my_worker.get_location()
+        opp_pos = opp_worker.get_location()
 
-        # Current carpet opportunities (unchanged from original)
+        score = (my_worker.get_points() - opp_worker.get_points()) * 100
+        
         my_carpet_value = sum(
-            enums.CARPET_POINTS_TABLE[m.roll_length]
+            CARPET_PTS.get(m.roll_length, 0)
             for m in my_moves
             if m.move_type == enums.MoveType.CARPET and m.roll_length >= 2
         )
-        score += my_carpet_value * 15
+        score += my_carpet_value * 20
 
         opp_carpet_value = sum(
-            enums.CARPET_POINTS_TABLE[m.roll_length]
+            CARPET_PTS.get(m.roll_length, 0)
             for m in opp_moves
             if m.move_type == enums.MoveType.CARPET and m.roll_length >= 2
         )
-        score -= opp_carpet_value * 10
+        # FIX 3: reduce opp carpet weight from 25 -> 12
+        # 25 was causing hugely negative evals when opponent had carpet options
+        # making the search comparison broken
+        score -= opp_carpet_value * 12
 
         score += len(my_moves) * 2
         score -= len(opp_moves) * 3
 
-        # Rat proximity (unchanged from original)
         if self.tracker:
             best_cell_idx = int(np.argmax(self.tracker.belief))
             best_prob = self.tracker.belief[best_cell_idx]
-            if best_prob > 0.4:
+            if best_prob > 0.3:
                 ry, rx = divmod(best_cell_idx, 8)
-                my_loc = my_worker.get_location()
-                dist = abs(my_loc[0] - rx) + abs(my_loc[1] - ry)
-                score += (14 - dist) * 3
+                dist = abs(my_pos[0] - rx) + abs(my_pos[1] - ry)
+                score += (14 - dist) * 4
 
-        my_pos = my_worker.get_location()
-        opp_pos = opp_worker.get_location()
-
-        # Open adjacent space squares (unchanged from original)
-        open_adjacent = sum(
-            1 for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]
-            if b.is_valid_cell((my_pos[0] + dx, my_pos[1] + dy))
-            and b.get_cell((my_pos[0] + dx, my_pos[1] + dy)) == enums.Cell.SPACE
-        )
-        score += open_adjacent * 5
-
-        # NEW: carpet potential — reward being near long buildable prime runs.
-        # This is what Albert Lite does better: it positions to roll len=4+ carpets.
-        # We value our potential more than opponent's to encourage long-chain planning.
-        my_potential = self._carpet_potential(b, my_pos)
-        opp_potential = self._carpet_potential(b, opp_pos)
-        score += my_potential * 6
-        score -= opp_potential * 4
+        my_potential = self._contested_carpet_potential(b, my_pos, opp_pos)
+        opp_potential = self._contested_carpet_potential(b, opp_pos, my_pos)
+        score += my_potential * 10
+        score -= opp_potential * 12
 
         return score
